@@ -1750,6 +1750,10 @@ def register_lakeflow_source(spark):
             self.lakeflow_connect = lakeflow_connect
             self.table_name = options[TABLE_NAME]
             self.table_options = {k: v for k, v in options.items() if k != IS_DELETE_FLOW}
+            # End offset frozen at the start of a Trigger.AvailableNow run so the
+            # engine has a fixed completion target and the stream terminates once
+            # it is reached (rather than running forever).  None => not frozen.
+            self._available_now_end = None
 
         def initialOffset(self):
             return {}
@@ -1770,6 +1774,12 @@ def register_lakeflow_source(spark):
                     f"got {type(limit).__name__}. Micro-batch sizing must be controlled "
                     f"by the connector implementation (table_options), not the engine."
                 )
+            # Under Trigger.AvailableNow, return the offset frozen at prepare time.
+            # This caps the run at a fixed end so that once the committed offset
+            # reaches it, the engine sees no further progress and terminates the
+            # update cleanly instead of looping forever.
+            if self._available_now_end is not None:
+                return self._available_now_end
             return self.lakeflow_connect.latest_offset(
                 self.table_name, self.table_options, start
             )
@@ -1788,8 +1798,14 @@ def register_lakeflow_source(spark):
             return map(lambda x: parse_value(x, self.schema), records)
 
         def prepareForTriggerAvailableNow(self) -> None:
-            # No need to do anything special here. Everything is handled in the __init__ method.
-            pass
+            # Freeze the end offset once, at the start of the AvailableNow run, so
+            # the triggered update has a fixed termination target.  latestOffset()
+            # then returns this frozen value for the rest of the run; once the
+            # committed offset reaches it, the engine stops.  Without this the
+            # end target could keep advancing and the stream would never finish.
+            self._available_now_end = self.lakeflow_connect.latest_offset(
+                self.table_name, self.table_options, None
+            )
 
 
     class LakeflowBatchReader(DataSourceReader):
